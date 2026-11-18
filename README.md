@@ -79,5 +79,33 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 序号33 · 指标过期清理与窗口引用检查
+
+旧版过期清理只看保留时长，过期后窗口指标数据失去计算口径。现在：
+
+- `sliding_index.expire_old_indexes(run_key=...)` 清理前先读取指标引用
+  （窗口指标数据 + 窗口策略绑定 + 进行中补算）：被引用的到期指标保留定义、
+  归档版本并把状态写入迟到补算清单（`backfill_job`）；引用全部解除后才停用。
+- 历史结果保留指标版本：定义快照写入 `_archived_versions`，窗口指标数据
+  携带 `_metric_version` 来源版本，过期指标的历史结果仍可解释。
+- 重算同一窗口只能使用仍有效的指标定义；保留到期与重算同时到达时二选一：
+  `extend` 延长保留直到窗口发布完成，`archive` 复制版本到归档后立即清理，
+  两种方案都保证当前可见结果只保留一个可解释口径。
+- 窗口配置模块 `sync_expired_metric_refs()` 读取过期指标清单，窗口仍引用时
+  保留定义并更新迟到补算清单，补齐窗口指标数据的来源版本。
+- 专用接口（注册在通用资源路由之前）：
+  - `POST /api/sliding_index/cleanup/run` 过期清理（同 run_key 幂等重放）
+  - `GET /api/sliding_index/{id}/references` 指标页引用窗口视图
+  - `GET /api/sliding_index/{id}/window_metrics` 序号33查询接口
+    （筛选/检索/排序/分页，并发查询只返回一版，同参数返回同一结果）
+  - `POST /api/sliding_index/{id}/recalculate` 窗口重算（extend/archive）
+  - `POST /api/sliding_index/{id}/release` 解除窗口结果引用
+  - `POST /api/window_config/sync_metric_refs` 窗口侧同步过期指标引用
+  - `GET /api/window_config/metric_version_confirmation` 窗口页版本确认
+- 清理/重算/同步均为跨模块事务：任一环节失败恢复所有原记录。
+- 前端：滑动指标页内嵌「序号33」面板（引用窗口、归档版本、窗口指标数据
+  分页详情、延期/归档重算），窗口配置页提供引用同步与版本确认；筛选条件
+  同步到 URL query，跨页面定位同一筛选结果。
+
 领域：数据工程
 子方向：数据分析与数据应用

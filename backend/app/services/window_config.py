@@ -202,3 +202,113 @@ class WindowConfigService(BaseModuleService):
             1 for r in rows if isinstance(r.get("window_definitions"), list)
         )
         return base
+
+    # ------------------------------------------------------------------
+    # 序号33 · 窗口配置读取过期指标清单
+    # ------------------------------------------------------------------
+
+    def sync_expired_metric_refs(self) -> dict[str, Any]:
+        """读取过期指标清单：窗口仍引用时保留定义并更新迟到补算清单。
+
+        窗口配置模块逐个检查到期/已过期指标：
+        - 窗口仍引用 → 保留定义（已被误标「已过期」的恢复为「已生效」）、
+          归档当前版本、把状态写入迟到补算清单（backfill_job）；
+        - 给窗口指标数据补上 ``_metric_version`` 来源版本，
+          保证历史结果仍能找到对应指标版本。
+        事务失败恢复原记录。
+        """
+        from app.services import service_for
+
+        idx_service = service_for("sliding_index")
+        now = time.time()
+        modules = ["sliding_index", "sink_output", "backfill_job", self.MODULE]
+        snapshot = store.snapshot_modules(modules)
+        try:
+            with store._lock:
+                synced: list[dict[str, Any]] = []
+                for idx in store.rows("sliding_index"):
+                    due = idx.get("status") == "已过期" or idx_service._retention_due(idx, now)
+                    if not due:
+                        continue
+                    name = idx.get("指标名称", "")
+                    refs = idx_service.find_metric_references(name)
+                    if not refs["referenced"]:
+                        continue
+
+                    # 窗口仍引用 → 保留定义
+                    restored = False
+                    if idx.get("status") == "已过期":
+                        idx["status"] = "已生效"
+                        idx["pending"] = True
+                        idx["_restored_by_window_sync"] = now
+                        restored = True
+                    idx_service._archive_version(idx, "window_sync_keep", now)
+
+                    # 保留窗口指标数据的来源版本
+                    stamped = 0
+                    for entry in store.rows("sink_output"):
+                        data = entry.get("data")
+                        if (
+                            isinstance(data, dict)
+                            and data.get("index") == name
+                            and "_metric_version" not in entry
+                        ):
+                            entry["_metric_version"] = idx.get("_version", 1)
+                            stamped += 1
+
+                    # 把状态写入迟到补算清单（幂等）
+                    job = idx_service._ensure_late_backfill_entry(idx, refs, now)
+                    synced.append({
+                        "index": name,
+                        "restored": restored,
+                        "version_stamped": stamped,
+                        "backfill_job": (job or {}).get("作业名称"),
+                        "references": (
+                            len(refs["current_results"]) + len(refs["window_policies"])
+                        ),
+                    })
+                return {"ok": True, "synced": synced, "timestamp": now}
+        except Exception:
+            store.restore_modules(snapshot)  # 序号33事务失败恢复原记录
+            raise
+
+    def metric_version_confirmation(self) -> dict[str, Any]:
+        """窗口页面视图：确认历史结果仍能找到对应指标版本。
+
+        按指标分组窗口指标数据，逐条核对来源版本是否仍在当前定义
+        （未过期时）或归档版本中，输出可解释性确认结果。
+        """
+        confirmations: list[dict[str, Any]] = []
+        with store._lock:
+            for idx in store.rows("sliding_index"):
+                name = idx.get("指标名称", "")
+                status = idx.get("status", "")
+                current_version = idx.get("_version", 1)
+                archived = {a.get("version") for a in idx.get("_archived_versions", [])}
+                results = []
+                for entry in store.rows("sink_output"):
+                    data = entry.get("data")
+                    if not (isinstance(data, dict) and data.get("index") == name):
+                        continue
+                    version = entry.get("_metric_version", current_version)
+                    version_found = (
+                        (status != "已过期" and version == current_version)
+                        or version in archived
+                    )
+                    results.append({
+                        "window_key": entry.get("_window_key", ""),
+                        "group": data.get("group", ""),
+                        "metric_version": version,
+                        "superseded": bool(entry.get("_superseded")),
+                        "version_found": version_found,
+                    })
+                if results:
+                    confirmations.append({
+                        "index": name,
+                        "index_status": status,
+                        "current_version": current_version,
+                        "archived_versions": sorted(v for v in archived if v is not None),
+                        "results": results,
+                        "all_explainable": all(r["version_found"] for r in results),
+                    })
+        return {"ok": True, "confirmations": confirmations}

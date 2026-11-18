@@ -37,6 +37,13 @@
       <button class="btn ghost" data-testid="reset" type="button" @click="resetFilters">重置条件</button>
     </form>
 
+    <MetricRetentionPanel
+      v-if="meta.key === 'sliding_index' || meta.key === 'window_config'"
+      :module-key="meta.key"
+      :rows="rows"
+      @changed="reload"
+    />
+
     <table class="data-table">
       <thead>
         <tr>
@@ -95,6 +102,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import {
   createEntry,
@@ -104,9 +112,12 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import MetricRetentionPanel from '@/views/MetricRetentionPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const route = useRoute()
+const router = useRouter()
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
@@ -179,6 +190,12 @@ async function runAction(action: string, row: EntryRow) {
 async function reload() {
   errorMessage.value = ''
   try {
+    // 序号33跨页面定位同一筛选结果：当前条件同步到 URL query，
+    // 从指标页跳转窗口页（或反向）时两页定位同一筛选结果。
+    const query = Object.fromEntries(
+      Object.entries(filters.value).filter(([, value]) => value),
+    )
+    void router.replace({ query })
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
@@ -187,5 +204,14 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  // 进入页面时从 URL query 恢复筛选条件（跨页面定位同一筛选结果）
+  for (const field of filterFields) {
+    const value = route.query[field]
+    if (typeof value === 'string' && value) {
+      filters.value[field] = value
+    }
+  }
+  void reload()
+})
 </script>

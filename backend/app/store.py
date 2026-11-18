@@ -3,10 +3,12 @@
 真实项目里这里会换成数据库访问层；当前实现只依赖标准库，保证克隆下来就能起。
 
 增强: DataChannel 跨模块数据通道 + FailureRecovery 失败恢复机制
+增强: 模块级事务快照/回滚 + 写锁 + 幂等运行记录（序号33指标保留清理使用）
 """
 from __future__ import annotations
 
 import copy
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -89,6 +91,29 @@ class Store:
         self._channels: dict[str, DataChannelEvent] = {}
         # 失败恢复记录：recovery_id → FailureRecovery
         self._failures: dict[str, FailureRecovery] = {}
+        # 写锁：保护跨模块事务（清理/重算/同步），并发查询只读到一致快照
+        self._lock = threading.RLock()
+        # 幂等运行记录：run_key → 清理结果，重复执行直接返回上次结果
+        self._cleanup_runs: dict[str, dict[str, Any]] = {}
+
+    # ---- 跨模块事务（序号33） ----
+
+    def snapshot_modules(self, modules: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """事务快照：深拷贝指定模块的表，事务失败时用于恢复原记录。"""
+        return {module: copy.deepcopy(self.rows(module)) for module in modules}
+
+    def restore_modules(self, snapshot: dict[str, list[dict[str, Any]]]) -> None:
+        """事务回滚：把指定模块的表恢复到快照状态。"""
+        for module, rows in snapshot.items():
+            self._tables[module] = rows
+
+    def cleanup_run_replay(self, run_key: str) -> dict[str, Any] | None:
+        """读取幂等运行记录：同一 run_key 的清理只执行一次。"""
+        return self._cleanup_runs.get(run_key)
+
+    def record_cleanup_run(self, run_key: str, result: dict[str, Any]) -> None:
+        """记录幂等运行结果。"""
+        self._cleanup_runs[run_key] = copy.deepcopy(result)
 
     # ---- 跨模块数据通道 ----
 
